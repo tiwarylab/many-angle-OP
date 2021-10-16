@@ -38,7 +38,7 @@ namespace colvar{
 /*
 
 \plumedfile
-LOAD FILE=ManyAngle.cpp
+LOAD FILE=ManyAngle2.cpp
 
 # Define groups for the CV
 INCLUDE FILE=centers.dat
@@ -67,6 +67,10 @@ bool pbc, serial;
   vector<AtomNumber> center_lista, start_lista, end_lista;
   std::vector<PLMD::AtomNumber> atomsToRequest;
   double rcut, rcut2;
+  // Up-down symmetry
+  bool doUpDownSymmetry;
+  // Low communication variant
+  bool doLowComm;
 
 public:
   explicit ManyAngle(const ActionOptions&);
@@ -83,6 +87,8 @@ void ManyAngle::registerKeywords( Keywords& keys ){
   keys.add("atoms","START","Start point of vector defining orientation");
   keys.add("atoms","END","End point of vector defining orientation");
   keys.add("compulsory","RCUT","1","Maximum distance for being neighbor");
+  keys.addFlag("UP_DOWN_SYMMETRY",false,"The symmetry is such that parallel and antiparallel vectors are not distinguished. The angle goes from 0 to pi/2 instead of from 0 to pi.");
+  keys.addFlag("LOW_COMM",false,"Use an algorithm with less communication between processors");
 }
 
 ManyAngle::ManyAngle(const ActionOptions&ao):
@@ -112,6 +118,16 @@ serial(false)
   log.printf("  The neighbor is defined within 0 and %f \n", rcut);
   rcut2 = rcut*rcut;
 
+  doUpDownSymmetry=false;
+  parseFlag("UP_DOWN_SYMMETRY",doUpDownSymmetry);
+  if (doUpDownSymmetry) log.printf("  The angle can take values between 0 and pi/2 due to the up down symmetry. \n");
+
+  doLowComm=false;
+  parseFlag("LOW_COMM",doLowComm);
+  if (doLowComm) {
+     log.printf("  Using the low communication variant of the algorithm");
+  }
+
   checkRead();
 
   atomsToRequest.reserve ( center_lista.size() + start_lista.size() + end_lista.size() );
@@ -125,65 +141,87 @@ serial(false)
 // calculator
 void ManyAngle::calculate()
 {
-  double cv=0.0;                         // (T)
+  double cv=0.0; // (T)
   unsigned nat=getNumberOfAtoms();
-  vector<Vector> deriv(nat);             // This will initialized vector with 0 modulo. (T)
-  unsigned int num_cv=0;                 // (T)
-
-  double angle(0.0);                     // (T)
-  double xi(0.0);                        // (T)
-  double pa(0.0);                        // (T)
-  double dcv_dangle(0.0);                // (T)
+  vector<Vector> deriv(nat); // This will initialized vector with 0 modulo. (T)
+  unsigned int num_cv=0; // (T)
   
   if(pbc) makeWhole();
   // Setup parallelization
   unsigned stride=comm.Get_size();
   unsigned rank=comm.Get_rank();
-
   if(serial){
     stride=1;
     rank=0;
   } else {
     stride=comm.Get_size();
-    rank=comm.Get_rank();
+    rank=comm.Get_rank(); // Somehow it is always rank=0. Does MPI really work? (T)
   }
-
-  for(unsigned int i=rank;i<(center_lista.size()-1);i+=stride) {
-    unsigned atom1_mol1=i+center_lista.size();
-    unsigned atom2_mol1=i+center_lista.size()+start_lista.size();
-    Vector dik=pbcDistance(getPosition(atom2_mol1),getPosition(atom1_mol1));
-    for(unsigned int j=i+1;j<center_lista.size();j+=1) {
-      if(getAbsoluteIndex(i)==getAbsoluteIndex(j)) continue;
-      Vector distance;
-      if(pbc){
-        distance=pbcDistance(getPosition(i),getPosition(j));
-      } else {
+  if (doLowComm) {
+    for(unsigned int i=rank;i<center_lista.size();i+=stride) {
+      unsigned atom1_mol1=i+center_lista.size(); // This start from index=i+center_lista, so it will actually read start_lista. (T)
+      unsigned atom2_mol1=i+center_lista.size()+start_lista.size(); // This will actually read end_lista. (T)
+      Vector dik=delta(getPosition(atom2_mol1),getPosition(atom1_mol1));
+      for(unsigned int j=0;j<center_lista.size();j+=1) {
+        double d2;
+        Vector distance;
+        if(getAbsoluteIndex(i)==getAbsoluteIndex(j)) continue;        
         distance=delta(getPosition(i),getPosition(j));
+        if ( (d2=distance[0]*distance[0])<rcut2 && (d2+=distance[1]*distance[1])<rcut2 && (d2+=distance[2]*distance[2])<rcut2) {
+          unsigned atom1_mol2=j+center_lista.size();
+          unsigned atom2_mol2=j+center_lista.size()+start_lista.size();
+          Vector dij=delta(getPosition(atom1_mol2),getPosition(atom2_mol2));
+
+          Vector ddij,ddik; // (T)
+          PLMD::Angle a; // (T)
+          double angle=a.compute(dij,dik,ddij,ddik); // (T)
+          
+          double xi=tanh(20.0*(angle-1.85)); // (T)
+          double pa=pi-2.0*angle; // (T)
+          cv += 0.5*(pa*xi + pi); // (T)
+          double dcv_dangle=10.0*pa*(1.0-xi*xi)-xi; // (T)
+          
+          deriv[atom1_mol1]+=dcv_dangle*ddik; // (T)
+          deriv[atom2_mol1]+=-dcv_dangle*ddik; // (T)
+          deriv[atom1_mol2]+=-dcv_dangle*ddij; // (T)
+          deriv[atom2_mol2]+=dcv_dangle*ddij; // (T)
+
+          num_cv++; // (T)
+        }
       }
+    }
+  } else {
+    for(unsigned int i=rank;i<(center_lista.size()-1);i+=stride) {
+      unsigned atom1_mol1=i+center_lista.size();
+      unsigned atom2_mol1=i+center_lista.size()+start_lista.size();
+      Vector dik=delta(getPosition(atom2_mol1),getPosition(atom1_mol1));
+      for(unsigned int j=i+1;j<center_lista.size();j+=1) {
+        Vector distance;
+        if(getAbsoluteIndex(i)==getAbsoluteIndex(j)) continue; // Only consider i != j. (T)        
+        distance=delta(getPosition(i),getPosition(j));
+        double d2;
+        if ( (d2=distance[0]*distance[0])<rcut2 && (d2+=distance[1]*distance[1])<rcut2 && (d2+=distance[2]*distance[2])<rcut2) {
+          unsigned atom1_mol2=j+center_lista.size();
+          unsigned atom2_mol2=j+center_lista.size()+start_lista.size();
+          Vector dij=delta(getPosition(atom1_mol2),getPosition(atom2_mol2));
 
-      double d2=0.0; // (T)
-      if ( (d2=distance[0]*distance[0])<rcut2 && (d2+=distance[1]*distance[1])<rcut2 && (d2+=distance[2]*distance[2])<rcut2) {
-        unsigned atom1_mol2=j+center_lista.size();
-        unsigned atom2_mol2=j+center_lista.size()+start_lista.size();
+          Vector ddij,ddik; // (T)
+          PLMD::Angle a; // (T)
+          double angle=a.compute(dij,dik,ddij,ddik); // (T)
+          
+          double xi=tanh(20.0*(angle-1.85)); // (T)
+          double pa=pi-2.0*angle; // (T)
+          cv += 0.5*(pa*xi + pi); // (T)
+          double dcv_dangle=10.0*pa*(1.0-xi*xi)-xi; // (T)
+          
+          // Perform chain rule. d(cv)/d(angle)*d(angle)/d(dik)
+          deriv[atom1_mol1]+=dcv_dangle*ddik; // (T)
+          deriv[atom2_mol1]+=-dcv_dangle*ddik; // (T)
+          deriv[atom1_mol2]+=-dcv_dangle*ddij; // (T)
+          deriv[atom2_mol2]+=dcv_dangle*ddij; // (T)
+          num_cv++; // (T)
 
-        Vector dij=pbcDistance(getPosition(atom1_mol2),getPosition(atom2_mol2));
-
-        Vector ddij,ddik;                            // (T)
-        PLMD::Angle a;                               // (T)
-        angle=a.compute(dij,dik,ddij,ddik);          // (T)
-        
-        xi=tanh(20.0*(angle-1.85));                  // (T)
-        pa=pi-2.0*angle;                             // (T)
-        cv += 0.5*(pa*xi + pi);                      // (T)
-        dcv_dangle=10.0*pa*(1.0-xi*xi)-xi;           // (T)
-        
-        // Chain rule. d(cv)/d(angle)*d(angle)/d(dik)
-        deriv[atom1_mol1]+=dcv_dangle*ddik;          // (T)
-        deriv[atom2_mol1]+=-dcv_dangle*ddik;         // (T)
-        deriv[atom1_mol2]+=-dcv_dangle*ddij;         // (T)
-        deriv[atom2_mol2]+=dcv_dangle*ddij;          // (T)
-        num_cv++;                                    // (T)
-
+          }
         }
       }
     }
@@ -194,14 +232,14 @@ void ManyAngle::calculate()
     // If atom 3 is involved in calculation of 2 angles when there are 3 angles being actually calculated, 
     // This derivatives of atom 3 will be the sum of derivatives of atom 3 calculated in each angle divided
     // by 3 (angles).
-    setAtomsDerivatives(i, deriv[i]/num_cv);         // (T)
+    setAtomsDerivatives(i, deriv[i]/num_cv); // (T)
     // This line is calculated in the same way as what has been defined in Colvar::setBoxDerivativesNoPbc(Value* v).
     virial-=Tensor(getPosition(i), deriv[i]/num_cv); // (T)
   }
-  setValue( cv/num_cv );                             // (T)
+  setValue( cv/num_cv ); // (T)
   // If double dcv_dangle, the box derivatives will double. When there are [num_cv] angles being calculated,
   // the box derivatives will be the sum of box derivatives of each individual angles.
-  setBoxDerivatives(virial);                         // (T)
+  setBoxDerivatives(virial); // (T)
 
 }
 
