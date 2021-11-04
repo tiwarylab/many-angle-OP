@@ -187,10 +187,16 @@ void ManyAngle::calculate()
         }
       }
     }
+
+  if(!serial){
+    comm.Sum(cv);
+    comm.Sum(num_cv);
+    for(unsigned i=0;i<nat;++i) comm.Sum(deriv[i]);
+  }
   
   // Assign output quantities
   Tensor virial; // (T)
-  for(unsigned i=0;i<nat;++i){ 
+  for(unsigned i=0;i<nat;++i){
     // If atom 3 is involved in calculation of 2 angles when there are 3 angles being actually calculated, 
     // This derivatives of atom 3 will be the sum of derivatives of atom 3 calculated in each angle divided
     // by 3 (angles).

@@ -225,6 +225,12 @@ void ManyAngle::calculate()
         }
       }
     }
+
+  if(!serial){
+    comm.Sum(cv);
+    comm.Sum(num_cv);
+    for(unsigned i=0;i<nat;++i) comm.Sum(deriv[i]);
+  }
   
   // Assign output quantities
   Tensor virial; // (T)
