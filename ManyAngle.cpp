@@ -191,7 +191,7 @@ void ManyAngle::calculate()
   if(!serial){
     comm.Sum(cv);
     comm.Sum(num_cv);
-    for(unsigned i=0;i<nat;++i) comm.Sum(deriv[i]);
+    comm.Sum(deriv);
   }
   
   // Assign output quantities
